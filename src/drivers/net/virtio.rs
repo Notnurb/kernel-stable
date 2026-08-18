@@ -1,0 +1,1049 @@
+//! A virtio-net driver.
+//!
+//! For details on the device, see [Network Device].
+//! For details on the Rust definitions, see [`virtio::net`].
+//!
+//! [Network Device]: https://docs.oasis-open.org/virtio/virtio/v1.2/cs01/virtio-v1.2-cs01.html#x1-2170001
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::mem::{ManuallyDrop, MaybeUninit};
+use core::str::FromStr;
+use core::{mem, slice};
+
+use smallvec::SmallVec;
+use smoltcp::phy::{Checksum, ChecksumCapabilities, DeviceCapabilities};
+use smoltcp::wire::{
+	ETHERNET_HEADER_LEN, EthernetFrame, IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
+	UdpPacket,
+};
+use virtio::DeviceConfigSpace;
+use virtio::net::{ConfigVolatileFieldAccess, Hdr, HdrF};
+use volatile::VolatileRef;
+use volatile::access::ReadOnly;
+
+use self::constants::MAX_NUM_VQ;
+use self::error::VirtioNetError;
+use crate::config::VIRTIO_MAX_QUEUE_SIZE;
+use crate::drivers::net::virtio::constants::BUFF_PER_PACKET;
+use crate::drivers::net::{NetworkDriver, mtu};
+use crate::drivers::virtio::error::VirtioError;
+use crate::drivers::virtio::transport::{InterruptCapability, UniCapsColl};
+use crate::drivers::virtio::virtqueue::packed::PackedVq;
+use crate::drivers::virtio::virtqueue::split::SplitVq;
+use crate::drivers::virtio::virtqueue::{
+	AvailBufferToken, BufferElem, BufferType, UsedBufferToken, VirtQueue, Virtq,
+};
+use crate::drivers::{Driver, InterruptHandlerMap, InterruptLine};
+use crate::executor::network::wake_network_waker;
+use crate::mm::device_alloc::DeviceAlloc;
+
+type NetDevCfg = crate::drivers::virtio::DevCfg<VirtioNetDriver>;
+
+fn determine_mtu(dev_cfg: &NetDevCfg) -> u16 {
+	// If VIRTIO_NET_F_MTU is negotiated, "the driver uses mtu as the maximum MTU value"
+	// (VirtIO specification, 5.1.3, "Feature bits")
+	if dev_cfg.features.contains(virtio::net::F::MTU) {
+		dev_cfg.raw.as_ptr().mtu().read().to_ne()
+	} else {
+		// Otherwise, we can just use the MTU we want to use
+		mtu()
+	}
+}
+
+fn determine_rx_buf_size(dev_cfg: &NetDevCfg) -> u32 {
+	// See Virtio specification v1.1 - 5.1.6.3.1 and 5.1.4.2
+
+	// Our desired minimum buffer size - we want it to be at least the MTU generally
+	let mut min_buf_size = determine_mtu(dev_cfg).into();
+
+	// If VIRTIO_NET_F_MRG_RXBUF is negotiated, each buffer MUST be at least the size of the struct virtio_net_hdr.
+	// We just use MTU in that case, but otherwise...
+	if dev_cfg.features.contains(virtio::net::F::MRG_RXBUF)
+		&& let Some(my_mrg_rxbuf_size) = hermit_var!("HERMIT_MRG_RXBUF_SIZE")
+	{
+		let my_mrg_rxbuf_size = u32::from_str(&my_mrg_rxbuf_size).unwrap();
+		assert!(
+			my_mrg_rxbuf_size > 0,
+			"VIRTIO does not allow buffer elements of size 0."
+		);
+		min_buf_size = my_mrg_rxbuf_size;
+	} else {
+		// "If VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6, [...] are negotiated, the driver SHOULD populate the
+		// receive queue(s) with buffers [...] of at least 65601 bytes [...]."
+		// VIRTIO spec. v1.4 sec. 5.1.9.3.1
+		if dev_cfg.features.contains(virtio::net::F::GUEST_TSO4)
+			|| dev_cfg.features.contains(virtio::net::F::GUEST_TSO6)
+			|| dev_cfg.features.contains(virtio::net::F::GUEST_UFO)
+		{
+			min_buf_size = u32::max(min_buf_size, 65601 - size_of::<Hdr>() as u32);
+		} else {
+			// Otherwise, the driver SHOULD populate the receive queue(s) with buffers of at least 1526 bytes.
+			min_buf_size = u32::max(min_buf_size, 1526 - size_of::<Hdr>() as u32);
+		}
+	}
+
+	min_buf_size
+}
+
+pub struct RxQueues {
+	vqs: Vec<VirtQueue>,
+	buf_size: u32,
+}
+
+impl RxQueues {
+	fn new(vqs: Vec<VirtQueue>, dev_cfg: &NetDevCfg) -> Self {
+		Self {
+			vqs,
+			buf_size: determine_rx_buf_size(dev_cfg),
+		}
+	}
+
+	/// Adds a given queue to the underlying vector and populates the queue with RecvBuffers.
+	///
+	/// Queues are all populated according to Virtio specification v1.1. - 5.1.6.3.1
+	fn add(&mut self, mut vq: VirtQueue) {
+		let num_bufs = vq.size() / BUFF_PER_PACKET;
+		fill_queue(&mut vq, num_bufs, self.buf_size);
+		self.vqs.push(vq);
+	}
+
+	fn get_next(&mut self) -> Option<UsedBufferToken> {
+		self.vqs[0].try_recv().ok()
+	}
+
+	fn enable_notifs(&mut self) {
+		for vq in &mut self.vqs {
+			vq.enable_notifs();
+		}
+	}
+
+	fn disable_notifs(&mut self) {
+		for vq in &mut self.vqs {
+			vq.disable_notifs();
+		}
+	}
+
+	fn has_packet(&self) -> bool {
+		self.vqs.iter().any(|vq| vq.has_used_buffers())
+	}
+}
+
+fn buffer_token_from_hdr(
+	hdr: Box<MaybeUninit<Hdr>, DeviceAlloc>,
+	buf_size: u32,
+) -> AvailBufferToken {
+	AvailBufferToken::new(SmallVec::new(), {
+		SmallVec::from_buf([
+			BufferElem::Sized(hdr),
+			BufferElem::Vector(Vec::with_capacity_in(
+				buf_size.try_into().unwrap(),
+				DeviceAlloc,
+			)),
+		])
+	})
+	.unwrap()
+}
+
+fn fill_queue(vq: &mut VirtQueue, num_bufs: u16, buf_size: u32) {
+	for _ in 0..num_bufs {
+		let buff_tkn = buffer_token_from_hdr(Box::<Hdr, _>::new_uninit_in(DeviceAlloc), buf_size);
+
+		// BufferTokens are directly provided to the queue
+		// TransferTokens are directly dispatched
+		// Transfers will be awaited at the queue
+		if let Err(err) = vq.dispatch(buff_tkn, false, BufferType::Direct) {
+			error!("{err:#?}");
+			break;
+		}
+	}
+}
+
+/// Structure which handles transmission of packets and delegation
+/// to the respective queue structures.
+pub struct TxQueues {
+	vqs: Vec<VirtQueue>,
+	buf_size: u32,
+}
+
+impl TxQueues {
+	fn new(vqs: Vec<VirtQueue>, dev_cfg: &NetDevCfg) -> Self {
+		Self {
+			vqs,
+			buf_size: determine_mtu(dev_cfg).into(),
+		}
+	}
+
+	#[allow(dead_code)]
+	fn enable_notifs(&mut self) {
+		for vq in &mut self.vqs {
+			vq.enable_notifs();
+		}
+	}
+
+	#[allow(dead_code)]
+	fn disable_notifs(&mut self) {
+		for vq in &mut self.vqs {
+			vq.disable_notifs();
+		}
+	}
+
+	/// Polls all queues for buffers whose transmission has been completed and returns the number of such buffers.
+	fn poll(&mut self) -> u32 {
+		let mut released_buffers = 0u32;
+		for vq in &mut self.vqs {
+			// We don't do anything with the buffers but we need to receive them for the
+			// ring slots to be emptied and the memory from the previous transfers to be freed.
+			while vq.try_recv().is_ok() {
+				released_buffers += 1;
+			}
+		}
+		released_buffers
+	}
+
+	fn add(&mut self, vq: VirtQueue) {
+		// Currently we are doing nothing with the additional queues. They are inactive and might be used in the
+		// future
+		self.vqs.push(vq);
+	}
+}
+
+/// Virtio network driver struct.
+///
+/// Struct allows to control devices virtqueues as also
+/// the device itself.
+pub(crate) struct VirtioNetDriver {
+	pub(super) dev_cfg: NetDevCfg,
+	pub(super) caps_coll: UniCapsColl,
+	pub(super) mtu: u16,
+	#[allow(unused)]
+	pub(super) ctrl_vq: Option<VirtQueue>,
+	pub(super) recv_vqs: RxQueues,
+	pub(super) send_vqs: TxQueues,
+	/// Capacity in number of buffer descriptors, not frames.
+	pub(super) send_capacity: u32,
+
+	/// Describes for what protocols and in which directions, if any, the checksum
+	/// should be calculated in software. It is the complement of what is offloaded
+	/// to the hardware.
+	pub(super) checksums: ChecksumCapabilities,
+}
+
+pub struct TxToken<'a> {
+	send_vqs: &'a mut TxQueues,
+	checksums: ChecksumCapabilities,
+	send_capacity: &'a mut u32,
+}
+
+impl Drop for TxToken<'_> {
+	fn drop(&mut self) {
+		*self.send_capacity += u32::from(BUFF_PER_PACKET);
+	}
+}
+
+impl smoltcp::phy::TxToken for TxToken<'_> {
+	fn consume<R, F>(self, len: usize, f: F) -> R
+	where
+		F: FnOnce(&mut [u8]) -> R,
+	{
+		// When the token is consumed, the capacity cannot be returned until its buffer is marked by the device as used.
+		// Thus, we bypass the Drop implementation that would do that prematurely and let the call to poll in the next
+		// call to this function return the capacity.
+		let mut token = ManuallyDrop::new(self);
+		assert!(len <= usize::try_from(token.send_vqs.buf_size).unwrap());
+		let mut packet = Vec::with_capacity_in(len, DeviceAlloc);
+		let result = unsafe {
+			let result = f(packet.spare_capacity_mut().assume_init_mut());
+			packet.set_len(len);
+			result
+		};
+
+		let mut header = Box::new_in(<Hdr as Default>::default(), DeviceAlloc);
+
+		// If a checksum calculation by the host is necessary, we have to inform the host within the header
+		// see Virtio specification 5.1.6.2
+		if let Some((ip_header_len, csum_offset)) =
+			VirtioNetDriver::should_request_checksum(&token.checksums, &mut packet)
+		{
+			header.flags = HdrF::NEEDS_CSUM;
+			header.csum_start =
+				(u16::try_from(ETHERNET_HEADER_LEN).unwrap() + ip_header_len).into();
+			header.csum_offset = csum_offset.into();
+		}
+
+		let buff_tkn = AvailBufferToken::new(
+			SmallVec::from_buf([BufferElem::Sized(header), BufferElem::Vector(packet)]),
+			SmallVec::new(),
+		)
+		.unwrap();
+
+		token.send_vqs.vqs[0]
+			.dispatch(buff_tkn, false, BufferType::Direct)
+			.unwrap();
+
+		result
+	}
+}
+
+pub struct RxToken<'a> {
+	recv_vqs: &'a mut RxQueues,
+	is_mrg_rxbuf_enabled: bool,
+	checksums: ChecksumCapabilities,
+}
+
+impl RxToken<'_> {
+	/// If we advertised receive checksum offload to smoltcp, we need to validate the packet
+	/// either by checking its virtio-net headers or checksum. Otherwise, it's smoltcp's responsibility
+	/// to validate the frame and we can pass the frame directly.
+	fn is_ethernet_frame_passable(&self, hdr: &Hdr, frame: &[u8]) -> bool {
+		// Nothing is offloaded to the device. We can pass the frame right off to smoltcp.
+		if self.checksums.tcp.rx() && self.checksums.udp.rx() {
+			return true;
+		}
+
+		let Ok(ethernet_frame) = EthernetFrame::new_checked(frame) else {
+			return false;
+		};
+
+		// We are receiving a frame that was sent by another virtio-net driver on the same host.
+		// Normally, the device should have filled in the checksum but passed the buffers right along
+		// instead as checksumming is not necessary for two guests on the same host.
+		if hdr.flags.contains(HdrF::NEEDS_CSUM) {
+			return true;
+		}
+
+		// We cannot benefit from the same host optimization but we've promised smoltcp to only pass frames
+		// that are validated so we need to do the validation ourselves.
+		match ethernet_frame.ethertype() {
+			smoltcp::wire::EthernetProtocol::Ipv4 => {
+				let Ok(ip_packet) = Ipv4Packet::new_checked(ethernet_frame.payload()) else {
+					return false;
+				};
+
+				// DATA_VALID only validates the outermost packet checksum (VIRTIO spec. sec. 5.1.6.4),
+				// which is IPv4 in this case. Thus, it does not save us from validating the TCP, UDP, etc.
+				// packet inside the IP packet. The outermost checksum is not the Ethernet FCS, as that part
+				// seems to be handled by the device and not handed over to us.
+				if !hdr.flags.contains(HdrF::DATA_VALID) && !ip_packet.verify_checksum() {
+				    return false;
+				}
+
+				if ip_packet.more_frags() || ip_packet.frag_offset() != 0 {
+					// The packet is part of a fragmented IP packet (RFC 791 page 8). We could check its checksum only
+					// if we reassembled it, so we discard it instead.
+					warn!("packet is fragmented, discarding!");
+					return false;
+				}
+
+				Self::is_ip_packet_passable(
+					ip_packet.next_header(),
+					ip_packet.payload(),
+					IpAddress::Ipv4(ip_packet.src_addr()),
+					IpAddress::Ipv4(ip_packet.dst_addr()),
+					&self.checksums,
+				)
+			}
+			smoltcp::wire::EthernetProtocol::Ipv6 => {
+				let Ok(ip_packet) = Ipv6Packet::new_checked(ethernet_frame.payload()) else {
+					return false;
+				};
+				// One level of checksum has been validated and IPv6 headers don't have their own checksums,
+				// so the validation from the device must have been for the IP protocol.
+				if hdr.flags.contains(HdrF::DATA_VALID) {
+					return true;
+				}
+
+				let next_header = ip_packet.next_header();
+				if next_header == IpProtocol::Ipv6Frag {
+					// The packet is part of a fragmented IP packet. We could check its checksum only if we reassembled
+					// it, so we discard it instead.
+					warn!("packet is fragmented, discarding!");
+					return false;
+				}
+
+				Self::is_ip_packet_passable(
+					next_header,
+					ip_packet.payload(),
+					IpAddress::Ipv6(ip_packet.src_addr()),
+					IpAddress::Ipv6(ip_packet.dst_addr()),
+					&self.checksums,
+				)
+			}
+			// ARP packets don't have checksums.
+			smoltcp::wire::EthernetProtocol::Arp
+			// We should have not taken over the validation of any unknown protocol from smoltcp and may let
+			// it take care of it.
+			| smoltcp::wire::EthernetProtocol::Unknown(_) => {
+				true
+			}
+		}
+	}
+
+	fn is_ip_packet_passable(
+		next_header: IpProtocol,
+		payload: &[u8],
+		src_addr: IpAddress,
+		dst_addr: IpAddress,
+		checksum_capabilities: &ChecksumCapabilities,
+	) -> bool {
+		match next_header {
+			IpProtocol::Tcp => {
+				if checksum_capabilities.tcp.rx() {
+					return true;
+				}
+				let Ok(packet) = TcpPacket::new_checked(payload) else {
+					return false;
+				};
+				packet.verify_checksum(&src_addr, &dst_addr)
+			}
+			IpProtocol::Udp => {
+				if checksum_capabilities.udp.rx() {
+					return true;
+				}
+				let Ok(packet) = UdpPacket::new_checked(payload) else {
+					return false;
+				};
+				packet.verify_checksum(&src_addr, &dst_addr)
+			}
+			_ => true,
+		}
+	}
+}
+
+impl smoltcp::phy::RxToken for RxToken<'_> {
+	fn consume<R, F>(self, f: F) -> R
+	where
+		F: FnOnce(&[u8]) -> R,
+	{
+		let Some(mut buffer_tkn) = self.recv_vqs.get_next() else {
+			// We overpromised a frame. The best we can do is to provide an empty frame to smoltcp and let it handle it as a faulty reception.
+			return f(&[]);
+		};
+		// Safety: any buffers that do not start with a `Hdr` must have been consumed by the previous call
+		// to this function.
+		let first_header = unsafe {
+			buffer_tkn
+				.used_recv_buff
+				.pop_front_downcast::<Hdr>()
+				.unwrap()
+		};
+		let first_packet = buffer_tkn.used_recv_buff.pop_front_vec().unwrap();
+
+		// According to VIRTIO spec v1.2 sec. 5.1.6.3.2, "num_buffers will always be 1 if VIRTIO_NET_F_MRG_RXBUF is not negotiated."
+		// Unfortunately, NVIDIA MLX5 does not comply with this requirement and we have to manually set the value to the correct one.
+		let num_buffers = if self.is_mrg_rxbuf_enabled {
+			first_header.num_buffers.to_ne()
+		} else {
+			1
+		};
+
+		let mut combined_packets = first_packet;
+		for _ in 1..num_buffers {
+			let mut buffer_tkn = self.recv_vqs.get_next().unwrap();
+			// The descriptor that was meant for the header of another frame was used for a portion of the current frame's contents.
+			// Thus, we cannot cast it to a Hdr.
+			let (header_descriptor, used_len) = buffer_tkn.used_recv_buff.pop_front_raw().unwrap();
+			combined_packets.extend_from_slice(unsafe {
+				slice::from_raw_parts((&raw const *header_descriptor).cast::<u8>(), used_len)
+			});
+
+			let packet = buffer_tkn.used_recv_buff.pop_front_vec().unwrap();
+			combined_packets.extend_from_slice(&packet);
+
+			let header = header_descriptor.downcast::<MaybeUninit<Hdr>>().unwrap();
+
+			let tkn = buffer_token_from_hdr(
+				// SAFETY: Box<T> -> Box<MaybeUninit<T>> is sound
+				header,
+				self.recv_vqs.buf_size,
+			);
+			self.recv_vqs.vqs[0]
+				.dispatch(tkn, false, BufferType::Direct)
+				.unwrap();
+		}
+
+		let res = if self.is_ethernet_frame_passable(&first_header, &combined_packets) {
+			f(&combined_packets)
+		} else {
+			warn!("Frame with invalid checksum received");
+			f(&[])
+		};
+
+		let first_tkn = buffer_token_from_hdr(
+			// SAFETY: Box<T> -> Box<MaybeUninit<T>> is sound
+			unsafe {
+				mem::transmute::<Box<Hdr, DeviceAlloc>, Box<MaybeUninit<Hdr>, DeviceAlloc>>(
+					first_header,
+				)
+			},
+			self.recv_vqs.buf_size,
+		);
+		self.recv_vqs.vqs[0]
+			.dispatch(first_tkn, false, BufferType::Direct)
+			.unwrap();
+
+		res
+	}
+}
+
+impl NetworkDriver for VirtioNetDriver {
+	/// Returns the mac address of the device.
+	/// If VIRTIO_NET_F_MAC is not set, the function panics currently!
+	fn get_mac_address(&self) -> [u8; 6] {
+		if self.dev_cfg.features.contains(virtio::net::F::MAC) {
+			self.caps_coll
+				.com_cfg
+				.device_config_space()
+				.read_config_with(|| self.dev_cfg.raw.as_ptr().mac().read())
+		} else {
+			unreachable!("Currently VIRTIO_NET_F_MAC must be negotiated!")
+		}
+	}
+
+	#[allow(dead_code)]
+	fn has_packet(&self) -> bool {
+		self.recv_vqs.has_packet()
+	}
+
+	fn set_polling_mode(&mut self, value: bool) {
+		if value {
+			self.disable_interrupts();
+		} else {
+			self.enable_interrupts();
+		}
+	}
+
+	fn handle_interrupt(&mut self) {
+		#[cfg_attr(
+			not(all(feature = "pci", target_arch = "x86_64")),
+			expect(irrefutable_let_patterns)
+		)]
+		let InterruptCapability::IsrStatus(isr_stat) = &mut self.caps_coll.int_cap else {
+			panic!("MSI-X vectors should be configured to the interrupt type-specific handlers.")
+		};
+
+		let status = isr_stat.acknowledge();
+
+		let config_change =
+			cfg_select! {
+				feature = "pci" => virtio::pci::IsrStatus::DEVICE_CONFIGURATION_INTERRUPT,
+				_ => virtio::mmio::InterruptStatus::CONFIGURATION_CHANGE_NOTIFICATION,
+			};
+		if status.contains(config_change) {
+			self.handle_device_configuration_interrupt();
+		}
+
+		wake_network_waker();
+	}
+}
+
+impl smoltcp::phy::Device for VirtioNetDriver {
+	type TxToken<'a> = TxToken<'a>;
+	type RxToken<'a> = RxToken<'a>;
+
+	fn capabilities(&self) -> DeviceCapabilities {
+		let mut device_capabilities = DeviceCapabilities::default();
+		device_capabilities.medium = smoltcp::phy::Medium::Ethernet;
+		device_capabilities.max_transmission_unit = self.mtu.into();
+		device_capabilities.max_burst_size =
+			Some(usize::try_from(self.send_capacity).unwrap() / usize::from(BUFF_PER_PACKET));
+		device_capabilities.checksum = self.checksums.clone();
+		device_capabilities
+	}
+
+	fn receive(
+		&mut self,
+		_timestamp: smoltcp::time::Instant,
+	) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+		if !self.recv_vqs.has_packet() {
+			return None;
+		}
+
+		self.free_up_send_capacity();
+
+		self.send_capacity = self.send_capacity.checked_sub(u32::from(BUFF_PER_PACKET))?;
+
+		Some((
+			RxToken {
+				recv_vqs: &mut self.recv_vqs,
+				is_mrg_rxbuf_enabled: self.dev_cfg.features.contains(virtio::net::F::MRG_RXBUF),
+				checksums: self.checksums.clone(),
+			},
+			TxToken {
+				send_vqs: &mut self.send_vqs,
+				checksums: self.checksums.clone(),
+				send_capacity: &mut self.send_capacity,
+			},
+		))
+	}
+
+	fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+		self.free_up_send_capacity();
+
+		self.send_capacity = self.send_capacity.checked_sub(u32::from(BUFF_PER_PACKET))?;
+
+		Some(TxToken {
+			send_vqs: &mut self.send_vqs,
+			checksums: self.checksums.clone(),
+			send_capacity: &mut self.send_capacity,
+		})
+	}
+}
+
+impl Driver for VirtioNetDriver {
+	fn get_name() -> &'static str {
+		"virtio-net"
+	}
+}
+
+// Backend-independent interface for Virtio network driver
+impl VirtioNetDriver {
+	/// Returns the current status of the device, if VIRTIO_NET_F_STATUS
+	/// has been negotiated. Otherwise assumes an active device.
+	#[cfg(not(feature = "pci"))]
+	pub fn dev_status(&self) -> virtio::net::S {
+		if self.dev_cfg.features.contains(virtio::net::F::STATUS) {
+			self.dev_cfg.raw.as_ptr().status().read()
+		} else {
+			virtio::net::S::LINK_UP
+		}
+	}
+
+	/// Returns the links status.
+	/// If feature VIRTIO_NET_F_STATUS has not been negotiated, then we assume the link is up!
+	#[cfg(feature = "pci")]
+	pub fn is_link_up(&self) -> bool {
+		if self.dev_cfg.features.contains(virtio::net::F::STATUS) {
+			self.dev_cfg
+				.raw
+				.as_ptr()
+				.status()
+				.read()
+				.contains(virtio::net::S::LINK_UP)
+		} else {
+			true
+		}
+	}
+
+	#[allow(dead_code)]
+	pub fn is_announce(&self) -> bool {
+		if self.dev_cfg.features.contains(virtio::net::F::STATUS) {
+			self.dev_cfg
+				.raw
+				.as_ptr()
+				.status()
+				.read()
+				.contains(virtio::net::S::ANNOUNCE)
+		} else {
+			false
+		}
+	}
+
+	/// Returns the maximal number of virtqueue pairs allowed. This is the
+	/// dominant setting to define the number of virtqueues for the network
+	/// device and overrides the num_vq field in the common config.
+	///
+	/// Returns 1 (i.e. minimum number of pairs) if VIRTIO_NET_F_MQ is not set.
+	#[allow(dead_code)]
+	pub fn get_max_vq_pairs(&self) -> u16 {
+		if self.dev_cfg.features.contains(virtio::net::F::MQ) {
+			self.dev_cfg
+				.raw
+				.as_ptr()
+				.max_virtqueue_pairs()
+				.read()
+				.to_ne()
+		} else {
+			1
+		}
+	}
+
+	pub fn disable_interrupts(&mut self) {
+		// For send and receive queues?
+		// Only for receive? Because send is off anyway?
+		self.recv_vqs.disable_notifs();
+	}
+
+	pub fn enable_interrupts(&mut self) {
+		// For send and receive queues?
+		// Only for receive? Because send is off anyway?
+		self.recv_vqs.enable_notifs();
+	}
+
+	/// If necessary, sets the TCP or UDP checksum field to the checksum of the
+	/// pseudo-header and returns the IP header length and the checksum offset.
+	/// Otherwise, returns None.
+	fn should_request_checksum<T: AsRef<[u8]> + AsMut<[u8]>>(
+		checksums: &ChecksumCapabilities,
+		frame: T,
+	) -> Option<(u16, u16)> {
+		if checksums.tcp.tx() && checksums.udp.tx() {
+			return None;
+		}
+
+		let ip_header_len: u16;
+		let ip_packet_len: usize;
+		let protocol;
+		let mut ethernet_frame = EthernetFrame::new_unchecked(frame);
+		let pseudo_header_checksum = match ethernet_frame.ethertype() {
+			smoltcp::wire::EthernetProtocol::Ipv4 => {
+				let ip_packet = Ipv4Packet::new_unchecked(&*ethernet_frame.payload_mut());
+				ip_header_len = ip_packet.header_len().into();
+				ip_packet_len = ip_packet.total_len().into();
+				protocol = ip_packet.next_header();
+				smoltcp::wire::checksum::pseudo_header_v4(
+					&ip_packet.src_addr(),
+					&ip_packet.dst_addr(),
+					protocol,
+					(ip_packet.total_len() - ip_header_len).into(),
+				)
+			}
+			smoltcp::wire::EthernetProtocol::Ipv6 => {
+				let ip_packet = Ipv6Packet::new_unchecked(&*ethernet_frame.payload_mut());
+				ip_header_len = ip_packet.header_len().try_into().expect(
+					"VIRTIO does not support IP headers that are longer than u16::MAX bytes.",
+				);
+				ip_packet_len = ip_packet.total_len();
+				protocol = ip_packet.next_header();
+				smoltcp::wire::checksum::pseudo_header_v6(
+					&ip_packet.src_addr(),
+					&ip_packet.dst_addr(),
+					protocol,
+					ip_packet.payload_len().into(),
+				)
+			}
+			// If the Ethernet protocol is not one of these two above, for which we know there may be a checksum field,
+			// we default to not asking for checksum, as otherwise the frame will be corrupted by the device trying
+			// to write the checksum.
+			_ => return None,
+		};
+
+		let ip_payload = &mut ethernet_frame.payload_mut()[ip_header_len.into()..ip_packet_len];
+		// Like the Ethernet protocol check, we check for IP protocols for which we know the location of the checksum field.
+		let csum_offset = if protocol == IpProtocol::Tcp && !checksums.tcp.tx() {
+			let mut tcp_packet = TcpPacket::new_unchecked(ip_payload);
+			tcp_packet.set_checksum(pseudo_header_checksum);
+			16
+		} else if protocol == IpProtocol::Udp && !checksums.udp.tx() {
+			let mut udp_packet = UdpPacket::new_unchecked(ip_payload);
+			udp_packet.set_checksum(pseudo_header_checksum);
+			6
+		} else {
+			return None;
+		};
+
+		Some((ip_header_len, csum_offset))
+	}
+
+	fn free_up_send_capacity(&mut self) {
+		// We need to poll to get the queue to remove elements from the table and open up capacity if possible.
+		self.send_capacity += self.send_vqs.poll() * u32::from(BUFF_PER_PACKET);
+	}
+
+	pub(crate) fn handle_device_configuration_interrupt(&self) {
+		if self.caps_coll.com_cfg.does_device_need_reset() {
+			todo!("Device configuration change notification cannot be handled yet");
+		}
+	}
+}
+
+impl crate::drivers::virtio::VirtioDriver for VirtioNetDriver {
+	type Config = virtio::net::Config;
+	type Error = VirtioNetError;
+	type DeviceFeatures = virtio::net::F;
+
+	const MINIMAL_FEATURES: Self::DeviceFeatures =
+		virtio::net::F::VERSION_1.union(virtio::net::F::MAC);
+	// If wanted, push new features into feats here:
+	const OPTIONAL_FEATURES: Self::DeviceFeatures =
+		// Indirect descriptors can be used
+		virtio::net::F::INDIRECT_DESC
+			// Packed Vq can be used
+			.union(virtio::net::F::RING_PACKED)
+			.union(virtio::net::F::NOTIFICATION_DATA)
+			// MTU setting can be used
+			.union(virtio::net::F::MTU)
+			// Driver can merge receive buffers
+			.union(virtio::net::F::MRG_RXBUF)
+			// the link status can be announced
+			.union(virtio::net::F::STATUS)
+			// control queue support
+			.union(virtio::net::F::CTRL_VQ)
+			// Multiqueue support
+			.union(virtio::net::F::MQ)
+			// Checksum calculation can partially be offloaded to the device
+			.union(virtio::net::F::CSUM)
+			// Partially checksummed frames can be received
+			.union(virtio::net::F::GUEST_CSUM)
+			// Frames with coalesced TCP segments can be received
+			.union(virtio::net::F::GUEST_TSO4)
+			.union(virtio::net::F::GUEST_TSO6);
+
+	/// Initializes the device in adherence to specification. Returns Some(VirtioNetError)
+	/// upon failure and None in case everything worked as expected.
+	///
+	/// See Virtio specification v1.1. - 3.1.1.
+	///                      and v1.1. - 5.1.5
+	fn init_dev(
+		(mut caps_coll, dev_cfg_raw): (
+			UniCapsColl,
+			VolatileRef<'static, virtio::net::Config, ReadOnly>,
+		),
+		handlers: &mut InterruptHandlerMap,
+		irq: Option<InterruptLine>,
+	) -> Result<Self, (VirtioError, UniCapsColl)> {
+		let mut mtu = None;
+		let mut recv_vqs = None;
+		let mut send_vqs = None;
+		let mut ctrl_vq = None;
+		let mut send_capacity = None;
+
+		let dev_cfg = match caps_coll.init_caps(dev_cfg_raw, |caps_coll, dev_cfg| {
+			mtu = Some(determine_mtu(dev_cfg));
+			let dev_spec_init = Self::dev_spec_init(caps_coll, dev_cfg)?;
+			debug!("Using RX buffer size of {}", dev_spec_init.0.buf_size);
+			recv_vqs = Some(dev_spec_init.0);
+			send_vqs = Some(dev_spec_init.1);
+			#[cfg_attr(
+				not(all(feature = "pci", target_arch = "x86_64")),
+				expect(unused_variables)
+			)]
+			let num_vqs = dev_spec_init.2;
+			ctrl_vq = Some(dev_spec_init.3);
+			send_capacity = Some(dev_spec_init.4);
+
+			info!("Device specific initialization for Virtio network device finished");
+
+			match &mut caps_coll.int_cap {
+				InterruptCapability::IsrStatus(_) => {
+					let irq = irq.unwrap();
+					handlers
+						.entry(irq)
+						.or_default()
+						.push_back(crate::executor::network::network_handler);
+					crate::arch::kernel::interrupts::add_irq_name(irq, "virtio");
+					info!("Virtio interrupt handler at line {irq}");
+				}
+				#[cfg(all(feature = "pci", target_arch = "x86_64"))]
+				InterruptCapability::Msix(msix_table) => {
+					let recv_vqs = (0..num_vqs).step_by(2);
+					let send_vqs = (1..num_vqs).step_by(2);
+					let ctrl_vq = dev_cfg
+						.features
+						.contains(virtio::net::F::CTRL_VQ)
+						.then_some(num_vqs);
+					caps_coll.com_cfg.register_msix_vectors(
+						msix_table,
+						handlers,
+						crate::executor::network::network_device_configuration_handler,
+						[(recv_vqs, wake_network_waker as fn())].into_iter(),
+						send_vqs.chain(ctrl_vq),
+					);
+				}
+			}
+			Ok(())
+		}) {
+			Ok(dev_cfg) => dev_cfg,
+			Err(err) => return Err((err, caps_coll)),
+		};
+
+		let mut checksums = ChecksumCapabilities::default();
+		// Not only should we offload receive checksum validation to the device for performance when possible, we MUST
+		// offload it when GUEST_TSO{4,6} are enabled, since otherwise the coalesced packets will be rejected by smoltcp
+		// because of the incorrect checksum.
+		if dev_cfg.features.contains(virtio::net::F::CSUM)
+			&& dev_cfg.features.contains(virtio::net::F::GUEST_CSUM)
+		{
+			checksums.udp = Checksum::None;
+			checksums.tcp = Checksum::None;
+		} else if dev_cfg.features.contains(virtio::net::F::CSUM) {
+			checksums.udp = Checksum::Rx;
+			checksums.tcp = Checksum::Rx;
+		} else if dev_cfg.features.contains(virtio::net::F::GUEST_CSUM) {
+			checksums.udp = Checksum::Tx;
+			checksums.tcp = Checksum::Tx;
+		}
+		debug!("{checksums:?}");
+
+		Ok(VirtioNetDriver {
+			dev_cfg,
+			caps_coll,
+			mtu: mtu.unwrap(),
+			ctrl_vq: ctrl_vq.unwrap(),
+			recv_vqs: recv_vqs.unwrap(),
+			send_vqs: send_vqs.unwrap(),
+			send_capacity: send_capacity.unwrap(),
+			checksums,
+		})
+	}
+
+	#[cfg(feature = "pci")]
+	fn no_dev_cfg_err(dev_id: u16) -> Self::Error {
+		VirtioNetError::NoDevCfg(dev_id)
+	}
+}
+
+impl VirtioNetDriver {
+	/// Device Specific initialization according to Virtio specifictation v1.1. - 5.1.5
+	///
+	/// Returns receive and send queues, the sum of their numbers, the control queue if it exists and the total send
+	/// capacity.
+	fn dev_spec_init(
+		caps_coll: &mut UniCapsColl,
+		dev_cfg: &NetDevCfg,
+	) -> Result<(RxQueues, TxQueues, u16, Option<VirtQueue>, u32), VirtioNetError> {
+		let (recv_vqs, send_vqs, num_vqs, send_capacity) =
+			Self::virtqueue_init(caps_coll, dev_cfg)?;
+		info!("Network driver successfully initialized virtqueues.");
+
+		// Add a control if feature is negotiated
+		let ctrl_vq = dev_cfg.features.contains(virtio::net::F::CTRL_VQ).then(|| {
+			let mut ctrl_vq = if dev_cfg.features.contains(virtio::net::F::RING_PACKED) {
+				VirtQueue::Packed(
+					PackedVq::new(
+						&mut caps_coll.com_cfg,
+						&caps_coll.notif_cfg,
+						VIRTIO_MAX_QUEUE_SIZE,
+						num_vqs,
+						dev_cfg.features.into(),
+					)
+					.unwrap(),
+				)
+			} else {
+				VirtQueue::Split(
+					SplitVq::new(
+						&mut caps_coll.com_cfg,
+						&caps_coll.notif_cfg,
+						VIRTIO_MAX_QUEUE_SIZE,
+						num_vqs,
+						dev_cfg.features.into(),
+					)
+					.unwrap(),
+				)
+			};
+
+			ctrl_vq.enable_notifs();
+			ctrl_vq
+		});
+		Ok((recv_vqs, send_vqs, num_vqs, ctrl_vq, send_capacity))
+	}
+
+	/// Initialize virtqueues via the queue interface and populates receiving queues
+	///
+	/// Returns receive and send queues, the sum of their numbers and the total send capacity.
+	fn virtqueue_init(
+		caps_coll: &mut UniCapsColl,
+		dev_cfg: &NetDevCfg,
+	) -> Result<(RxQueues, TxQueues, u16, u32), VirtioNetError> {
+		// We are assuming here, that the device single source of truth is the
+		// device specific configuration. Hence we do NOT check if
+		//
+		// max_virtqueue_pairs + 1 < num_queues
+		//
+		// - the plus 1 is due to the possibility of an existing control queue
+		// - the num_queues is found in the ComCfg struct of the device and defines the maximal number
+		// of supported queues.
+		let num_vqs = if dev_cfg.features.contains(virtio::net::F::MQ) {
+			(dev_cfg.raw.as_ptr().max_virtqueue_pairs().read().to_ne() * 2).min(MAX_NUM_VQ)
+		} else {
+			// Minimal number of virtqueues defined in the standard v1.1. - 5.1.5 Step 1
+			2
+		};
+
+		// The loop is running from 0 to num_vqs and the indexes are provided in this way
+		// in order to allow the indexes of the queues to be in a form of:
+		//
+		// index i for receive queue
+		// index i+1 for send queue
+		//
+		// as it is wanted by the network network device.
+		// see Virtio specification v1.1. - 5.1.2
+		// Assure that we have always an even number of queues (i.e. pairs of queues).
+		assert_eq!(num_vqs % 2, 0);
+
+		let mut recv_vqs = RxQueues::new(Vec::new(), dev_cfg);
+		let mut send_vqs = TxQueues::new(Vec::new(), dev_cfg);
+		let mut send_capacity = 0;
+
+		for i in 0..(num_vqs / 2) {
+			if dev_cfg.features.contains(virtio::net::F::RING_PACKED) {
+				let mut vq = PackedVq::new(
+					&mut caps_coll.com_cfg,
+					&caps_coll.notif_cfg,
+					VIRTIO_MAX_QUEUE_SIZE,
+					2 * i,
+					dev_cfg.features.into(),
+				)
+				.unwrap();
+				// Interrupt for receiving packets is wanted
+				vq.enable_notifs();
+
+				recv_vqs.add(VirtQueue::Packed(vq));
+
+				let mut vq = PackedVq::new(
+					&mut caps_coll.com_cfg,
+					&caps_coll.notif_cfg,
+					VIRTIO_MAX_QUEUE_SIZE,
+					2 * i + 1,
+					dev_cfg.features.into(),
+				)
+				.unwrap();
+				// Interrupt for communicating that a sent packet left, is not needed
+				vq.disable_notifs();
+
+				send_capacity += u32::from(vq.size());
+				send_vqs.add(VirtQueue::Packed(vq));
+			} else {
+				let mut vq = SplitVq::new(
+					&mut caps_coll.com_cfg,
+					&caps_coll.notif_cfg,
+					VIRTIO_MAX_QUEUE_SIZE,
+					2 * i,
+					dev_cfg.features.into(),
+				)
+				.unwrap();
+				// Interrupt for receiving packets is wanted
+				vq.enable_notifs();
+
+				recv_vqs.add(VirtQueue::Split(vq));
+
+				let mut vq = SplitVq::new(
+					&mut caps_coll.com_cfg,
+					&caps_coll.notif_cfg,
+					VIRTIO_MAX_QUEUE_SIZE,
+					2 * i + 1,
+					dev_cfg.features.into(),
+				)
+				.unwrap();
+				// Interrupt for communicating that a sent packet left, is not needed
+				vq.disable_notifs();
+				send_capacity += u32::from(vq.size());
+				send_vqs.add(VirtQueue::Split(vq));
+			}
+		}
+
+		Ok((recv_vqs, send_vqs, num_vqs, send_capacity))
+	}
+}
+
+pub mod constants {
+	// Configuration constants
+	pub const MAX_NUM_VQ: u16 = 2;
+	pub(super) const BUFF_PER_PACKET: u16 = 2;
+}
+
+/// Error module of virtios network driver. Containing the (VirtioNetError)[VirtioNetError]
+/// enum.
+pub mod error {
+	use thiserror::Error;
+
+	/// Network drivers error enum.
+	#[derive(Error, Debug, Copy, Clone)]
+	pub enum VirtioNetError {
+		#[cfg(feature = "pci")]
+		#[error(
+			"Virtio network driver failed, for device {0:x}, due to a missing or malformed device config!"
+		)]
+		NoDevCfg(u16),
+	}
+}

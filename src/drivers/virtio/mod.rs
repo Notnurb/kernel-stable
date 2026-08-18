@@ -1,0 +1,347 @@
+//! Virtio infrastructure.
+//!
+//! This module provides [`transport`] infrastructure as well as [`virtqueue`] infrastructure.
+
+#![cfg_attr(
+	not(any(
+		feature = "virtio-console",
+		feature = "virtio-fs",
+		feature = "virtio-net",
+		feature = "virtio-vsock"
+	)),
+	allow(dead_code)
+)]
+
+pub mod transport;
+pub mod virtqueue;
+
+use core::fmt;
+
+use bitflags::Flags;
+use virtio::FeatureBits;
+
+use crate::drivers::virtio::error::VirtioError;
+use crate::drivers::virtio::transport::UniCapsColl;
+
+trait VirtioIdExt {
+	fn as_feature(&self) -> Option<&str>;
+}
+
+impl VirtioIdExt for virtio::Id {
+	fn as_feature(&self) -> Option<&str> {
+		let feature = match self {
+			Self::Net => "virtio-net",
+			Self::Console => "virtio-console",
+			Self::Fs => "virtio-fs",
+			Self::Vsock => "virtio-vsock",
+			_ => return None,
+		};
+
+		Some(feature)
+	}
+}
+
+mod control_registers_access {
+	use core::{array, mem};
+
+	use virtio::{le32, le128};
+	use volatile::VolatilePtr;
+	use volatile::access::ReadWrite;
+
+	pub trait ControlRegistersAccess<'a>: Sized + Copy {
+		fn read_device_feature_word(self, i: u32) -> le32;
+		fn write_driver_feature_word(self, i: u32, word: le32);
+
+		fn read_device_features(self) -> virtio::F {
+			let features = array::from_fn(|i| {
+				let i = u32::try_from(i).unwrap();
+				self.read_device_feature_word(i)
+			});
+
+			let features = unsafe { mem::transmute::<[le32; 4], le128>(features) };
+
+			virtio::F::from_bits_retain(features)
+		}
+
+		fn write_driver_features(self, features: virtio::F) {
+			let features = features.bits();
+
+			let features = unsafe { mem::transmute::<le128, [le32; 4]>(features) };
+
+			for (i, word) in features.into_iter().enumerate() {
+				let i = u32::try_from(i).unwrap();
+				self.write_driver_feature_word(i, word);
+			}
+		}
+	}
+
+	#[cfg(feature = "pci")]
+	impl<'a> ControlRegistersAccess<'a> for VolatilePtr<'a, virtio::pci::CommonCfg, ReadWrite> {
+		fn read_device_feature_word(self, i: u32) -> le32 {
+			use virtio::pci::CommonCfgVolatileFieldAccess;
+
+			self.device_feature_select().write(i.into());
+			self.device_feature().read()
+		}
+
+		fn write_driver_feature_word(self, i: u32, word: le32) {
+			use virtio::pci::CommonCfgVolatileFieldAccess;
+
+			self.driver_feature_select().write(i.into());
+			self.driver_feature().write(word);
+		}
+	}
+
+	#[cfg(not(feature = "pci"))]
+	impl<'a> ControlRegistersAccess<'a> for VolatilePtr<'a, virtio::mmio::DeviceRegisters, ReadWrite> {
+		fn read_device_feature_word(self, i: u32) -> le32 {
+			use virtio::mmio::DeviceRegistersVolatileFieldAccess;
+
+			// QEMU only supports index 0 and 1 for virtio-mmio:
+			// https://gitlab.com/qemu-project/qemu/-/blob/v10.2.0/hw/virtio/virtio-mmio.c#L305-311
+			if i > 1 {
+				return 0.into();
+			}
+
+			self.device_features_sel().write(i.into());
+			self.device_features().read()
+		}
+
+		fn write_driver_feature_word(self, i: u32, word: le32) {
+			use virtio::mmio::DeviceRegistersVolatileFieldAccess;
+
+			// QEMU only supports index 0 and 1 for virtio-mmio:
+			// https://gitlab.com/qemu-project/qemu/-/blob/v10.2.0/hw/virtio/virtio-mmio.c#L326-332
+			if i > 1 {
+				debug_assert!(word.to_ne() == 0);
+				return;
+			}
+
+			self.driver_features_sel().write(i.into());
+			self.driver_features().write(word);
+		}
+	}
+}
+
+pub trait ControlRegisters<'a>: control_registers_access::ControlRegistersAccess<'a> {
+	fn negotiate_features<DF>(self, driver_features: DF) -> DF
+	where
+		DF: FeatureBits + From<virtio::F> + AsRef<virtio::F> + AsMut<virtio::F> + fmt::Debug + Copy,
+		virtio::F: From<DF> + AsRef<DF> + AsMut<DF>;
+}
+
+impl<'a, T> ControlRegisters<'a> for T
+where
+	T: control_registers_access::ControlRegistersAccess<'a>,
+{
+	fn negotiate_features<DF>(self, driver_features: DF) -> DF
+	where
+		DF: FeatureBits + From<virtio::F> + AsRef<virtio::F> + AsMut<virtio::F> + fmt::Debug + Copy,
+		virtio::F: From<DF> + AsRef<DF> + AsMut<DF>,
+	{
+		let device_features = DF::from(self.read_device_features());
+		info!("device_features = {device_features:?}");
+		debug_assert!(
+			device_features.requirements_satisfied(),
+			"The device offers a feature which requires another feature which was not offered."
+		);
+
+		info!("driver_features = {driver_features:?}");
+		debug_assert!(
+			driver_features.requirements_satisfied(),
+			"The driver offers a feature which requires another feature which was not offered.",
+		);
+
+		let common_features = device_features.intersection(driver_features);
+		info!("common_features = {common_features:?}");
+		// This should be logically unreachable.
+		debug_assert!(
+			common_features.requirements_satisfied(),
+			"We negotiated a feature which requires another feature which was not negotiated."
+		);
+
+		self.write_driver_features(common_features.into());
+
+		common_features
+	}
+}
+
+pub(super) trait VirtioDriver: super::Driver + Sized
+where
+	virtio::F:
+		From<Self::DeviceFeatures> + AsRef<Self::DeviceFeatures> + AsMut<Self::DeviceFeatures>,
+{
+	type Config: 'static;
+	type Error: Into<VirtioError>;
+	type DeviceFeatures: FeatureBits + fmt::Debug + Copy;
+
+	const MINIMAL_FEATURES: Self::DeviceFeatures;
+	const OPTIONAL_FEATURES: Self::DeviceFeatures;
+
+	fn init_dev(
+		caps_tuple: (
+			UniCapsColl,
+			volatile::VolatileRef<'static, Self::Config, volatile::access::ReadOnly>,
+		),
+		handlers: &mut super::InterruptHandlerMap,
+		irq: Option<super::InterruptLine>,
+	) -> Result<Self, (VirtioError, UniCapsColl)>;
+
+	#[cfg(feature = "pci")]
+	fn no_dev_cfg_err(dev_id: u16) -> Self::Error;
+}
+
+impl UniCapsColl {
+	pub(super) fn init_caps<T: VirtioDriver>(
+		&mut self,
+		dev_cfg_raw: volatile::VolatileRef<'static, T::Config, volatile::access::ReadOnly>,
+		mut device_specific_setup: impl FnMut(&mut Self, &mut DevCfg<T>) -> Result<(), T::Error>,
+	) -> Result<DevCfg<T>, VirtioError>
+	where
+		virtio::F: From<T::DeviceFeatures> + AsRef<T::DeviceFeatures> + AsMut<T::DeviceFeatures>,
+	{
+		// Reset
+		self.com_cfg.reset_dev();
+
+		// Indicate device, that OS noticed it
+		self.com_cfg.ack_dev();
+
+		// Indicate device, that driver is able to handle it
+		self.com_cfg.set_drv();
+
+		let negotiated_features = self
+			.com_cfg
+			.control_registers()
+			.negotiate_features(T::MINIMAL_FEATURES.union(T::OPTIONAL_FEATURES));
+
+		if !negotiated_features.contains(T::MINIMAL_FEATURES) {
+			error!("Device features set, does not satisfy minimal features needed. Aborting!");
+			return Err(VirtioError::FailFeatureNeg);
+		}
+
+		// Indicates the device, that the current feature set is final for the driver
+		// and will not be changed.
+		self.com_cfg.features_ok();
+
+		// Checks if the device has accepted final set. This finishes feature negotiation.
+		let mut dev_cfg = if self.com_cfg.check_features() {
+			info!(
+				"Features have been negotiated between {} device and driver.",
+				T::get_name()
+			);
+			// Set feature set in device config for future use.
+			DevCfg {
+				raw: dev_cfg_raw,
+				features: negotiated_features,
+			}
+		} else {
+			error!("The device does not support our subset of features.");
+			return Err(VirtioError::FailFeatureNeg);
+		};
+
+		device_specific_setup(self, &mut dev_cfg).map_err(|err| err.into())?;
+
+		// At this point the device is "live"
+		self.com_cfg.drv_ok();
+
+		Ok(dev_cfg)
+	}
+}
+
+/// A wrapper struct for the raw configuration structure.
+/// Handling the right access to fields, as some are read-only
+/// for the driver.
+pub(super) struct DevCfg<T: VirtioDriver>
+where
+	virtio::F: From<T::DeviceFeatures> + AsRef<T::DeviceFeatures> + AsMut<T::DeviceFeatures>,
+{
+	pub(super) features: T::DeviceFeatures,
+	#[cfg_attr(
+		all(
+			not(any(
+				feature = "virtio-fs",
+				feature = "virtio-net",
+				feature = "virtio-vsock",
+			)),
+			feature = "virtio-console"
+		),
+		expect(dead_code)
+	)]
+	pub(super) raw: volatile::VolatileRef<'static, T::Config, volatile::access::ReadOnly>,
+}
+
+pub mod error {
+	use thiserror::Error;
+
+	#[cfg(feature = "virtio-console")]
+	pub use crate::drivers::console::error::VirtioConsoleError;
+	#[cfg(feature = "virtio-fs")]
+	pub use crate::drivers::fs::error::VirtioFsInitError;
+	#[cfg(all(
+		not(all(target_arch = "riscv64", feature = "gem-net", not(feature = "pci"))),
+		not(feature = "rtl8139"),
+		feature = "virtio-net",
+	))]
+	pub use crate::drivers::net::virtio::error::VirtioNetError;
+	#[cfg(feature = "pci")]
+	use crate::drivers::pci::error::PciError;
+	#[cfg(feature = "virtio-rng")]
+	pub use crate::drivers::rng::error::VirtioRngError;
+	#[cfg(feature = "virtio-vsock")]
+	pub use crate::drivers::vsock::error::VirtioVsockError;
+
+	#[derive(Error, Debug)]
+	pub enum VirtioError {
+		#[cfg(feature = "pci")]
+		#[error(transparent)]
+		FromPci(PciError),
+
+		#[cfg(feature = "pci")]
+		#[error(
+			"Virtio driver failed, for device {0:x}, due to a missing or malformed common config!"
+		)]
+		NoComCfg(u16),
+
+		#[cfg(feature = "pci")]
+		#[error(
+			"Virtio driver failed, for device {0:x}, due to a missing or malformed ISR status config!"
+		)]
+		NoIsrCfg(u16),
+
+		#[cfg(feature = "pci")]
+		#[error(
+			"Virtio driver failed, for device {0:x}, due to a missing or malformed notification config!"
+		)]
+		NoNotifCfg(u16),
+
+		#[error("Device with id {0:#x} not supported.")]
+		DevNotSupported(u16),
+
+		#[error("Virtio driver failed, device did not acknowledge negotiated feature set!")]
+		FailFeatureNeg,
+
+		#[cfg(all(
+			not(all(target_arch = "riscv64", feature = "gem-net", not(feature = "pci"))),
+			not(feature = "rtl8139"),
+			feature = "virtio-net",
+		))]
+		#[error(transparent)]
+		NetDriver(#[from] VirtioNetError),
+
+		#[cfg(feature = "virtio-fs")]
+		#[error(transparent)]
+		FsDriver(#[from] VirtioFsInitError),
+
+		#[cfg(feature = "virtio-vsock")]
+		#[error(transparent)]
+		VsockDriver(#[from] VirtioVsockError),
+
+		#[cfg(feature = "virtio-console")]
+		#[error(transparent)]
+		ConsoleDriver(#[from] VirtioConsoleError),
+
+		#[cfg(feature = "virtio-rng")]
+		#[error(transparent)]
+		RngDriver(#[from] VirtioRngError),
+	}
+}
