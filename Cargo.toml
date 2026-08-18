@@ -1,14 +1,14 @@
 [package]
-name = "hermit-kernel"
-version = "0.13.0"
+name = "prism"
+version = "0.0.1-stable"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-keywords = ["unikernel", "libos"]
+keywords = ["unikernel", "libos", "os"]
 categories = ["os"]
-repository = "https://github.com/hermit-os/kernel"
-documentation = "https://hermit-os.github.io/kernel/hermit/"
+repository = "https://github.com/Notnurb/kernel-stable"
+documentation = "https://github.com/Notnurb/kernel-stable"
 edition = "2024"
-description = "A Rust-based library operating system"
+description = "Prism: a Rust-based library operating system"
 exclude = [
 	"/.github/*",
 	"/.vscode/*",
@@ -21,7 +21,7 @@ exclude = [
 all-features = true
 
 [lib]
-name = "hermit"
+name = "prism"
 
 [[test]]
 name = "basic_math"
